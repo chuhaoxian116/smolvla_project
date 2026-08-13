@@ -16,37 +16,28 @@ EPISODES = 3
 
 TASK = "Move the robot to a target pose."
 
-REPO_ID = "local/mock_robot_dataset"
+REPO_ID = "local/mock_multi_episode_dataset"
 
 DATASET_ROOT = Path(
     "/home/smartrobot/Documents/smolvla_workspace/"
-    "datasets/mock_robot_dataset"
+    "datasets/mock_multi_episode_dataset"
 )
 
-# 为了方便重复学习运行：
-# True  = 如果目录已存在，删除后重新创建
-# False = 已存在时直接报错，避免覆盖
 RESET_DATASET = True
 
 
 class MockRobot:
-    """模拟机器人：当前 State 逐步跟踪上一周期下发的绝对关节目标。"""
+    """模拟机器人：State 逐步跟踪上一周期下发的绝对关节目标。"""
 
-    def __init__(self):
-        self.state = np.zeros(ACTION_DIM, dtype=np.float32)
+    def __init__(self, initial_offset: float = 0.0):
+        self.state = np.full(ACTION_DIM, initial_offset, dtype=np.float32)
         self.target = self.state.copy()
 
     def get_observation(self, frame_index: int):
-        # 模拟实际机器人不会瞬间到达 Action，而是逐步跟踪。
         self.state += 0.25 * (self.target - self.state)
 
-        # 模拟 RGB Camera。
-        # 使用 uint8 HWC: [H, W, C]
         image = np.zeros((IMAGE_H, IMAGE_W, 3), dtype=np.uint8)
-
-        # 让图像随时间变化，方便后续确认每一帧不是完全一样。
-        value = frame_index % 256
-        image[:, :, 0] = value
+        image[:, :, 0] = frame_index % 256
 
         return {
             "observation.state": self.state.copy(),
@@ -54,19 +45,22 @@ class MockRobot:
         }
 
     def send_action(self, action: np.ndarray):
-        # 本 Demo 的 Action 语义：
-        # 绝对 Joint Target。
         self.target = action.astype(np.float32).copy()
 
 
 class MockExpert:
-    """模拟人工专家 / 示教器 / Leader Arm，产生绝对关节目标。"""
+    """模拟人工专家 / 示教器 / Leader Arm。"""
+
+    def __init__(self, phase: float = 0.0):
+        self.phase = phase
 
     def get_action(self, timestamp: float) -> np.ndarray:
         action = np.zeros(ACTION_DIM, dtype=np.float32)
 
         for i in range(ACTION_DIM):
-            action[i] = 0.2 * math.sin(timestamp + i * 0.2)
+            action[i] = 0.2 * math.sin(
+                timestamp + self.phase + i * 0.2
+            )
 
         return action
 
@@ -115,14 +109,12 @@ def create_dataset():
     }
 
     print("========== Create LeRobotDataset ==========")
-    print(f"Repo ID : {REPO_ID}")
-    print(f"Root    : {DATASET_ROOT}")
-    print(f"FPS     : {FPS}")
+    print(f"Repo ID  : {REPO_ID}")
+    print(f"Root     : {DATASET_ROOT}")
+    print(f"FPS      : {FPS}")
+    print(f"Episodes : {EPISODES}")
 
-    # use_videos=False:
-    # 第一版先使用 image-backed Dataset，
-    # 避免一开始引入 MP4 编码流程。
-    dataset = LeRobotDataset.create(
+    return LeRobotDataset.create(
         repo_id=REPO_ID,
         root=DATASET_ROOT,
         fps=FPS,
@@ -131,60 +123,53 @@ def create_dataset():
         use_videos=False,
     )
 
-    return dataset
 
-
-def record_one_episode(dataset: LeRobotDataset):
-    robot = MockRobot()
-    expert = MockExpert()
-
-    print("\n========== Record Episode 0 ==========")
+def record_episodes(dataset: LeRobotDataset):
+    print("\n========== Record Episodes ==========")
 
     for episode_index in range(EPISODES):
-        print(f"\n--- Episode {episode_index} ---")
+        # 一个 Episode = 一次独立、连续、完整的任务示教。
+        # 重新创建 Robot / Expert，模拟：
+        # “任务完成 -> 场景复位 -> 下一次示教”。
+        robot = MockRobot(initial_offset=0.02 * episode_index)
+        expert = MockExpert(phase=0.15 * episode_index)
+
+        print(f"\n--- Episode {episode_index} START ---")
 
         for frame_index in range(NUM_FRAMES):
             timestamp = frame_index / FPS
 
-            # 1. 读取当前机器人 Observation。
             observation = robot.get_observation(frame_index)
-
-            # 2. Expert 产生当前周期的绝对 Action。
             action = expert.get_action(timestamp)
 
-            # 3. 组成 LeRobot Frame。
-            #
-            # 注意：
-            # episode_index / frame_index / timestamp / next.done
-            # 不需要我们自己塞进去，LeRobotDataset 会根据采集过程生成。
             frame = {
                 **observation,
                 "action": action,
                 "task": TASK,
             }
 
-            # 4. 真正写入 LeRobot 当前 Episode Buffer。
             dataset.add_frame(frame)
-
-            # 5. 同一个 Action 下发给 MockRobot。
             robot.send_action(action)
 
             print(
+                f"Episode {episode_index} | "
                 f"Frame {frame_index:02d} | "
                 f"t={timestamp:5.2f}s | "
                 f"state[0]={observation['observation.state'][0]: .4f} | "
                 f"action[0]={action[0]: .4f}"
             )
 
-        # 把当前 Episode Buffer 真正保存到磁盘。
-        # 这一整段连续示教到这里结束，构成一个完整 Episode。
+        # 当前这一次完整任务示教结束。
         dataset.save_episode()
 
-    # Dataset v3 写完后必须 finalize，
-    # 用来刷新 metadata、关闭 parquet writer。
+        print(
+            f"--- Episode {episode_index} END: "
+            f"save_episode() ---"
+        )
+
     dataset.finalize()
 
-    print("\nEpisode saved and dataset finalized.")
+    print("\nAll episodes saved and dataset finalized.")
 
 
 def inspect_saved_dataset():
@@ -204,48 +189,63 @@ def inspect_saved_dataset():
     print(f"Robot    : {dataset.meta.robot_type}")
     print(f"Cameras  : {dataset.meta.camera_keys}")
 
-    print("\n========== First Frame ==========")
-    frame0 = dataset[0]
+    print("\n========== Episode Metadata ==========")
 
-    print(f"episode_index : {frame0['episode_index']}")
-    print(f"frame_index   : {frame0['frame_index']}")
-    print(f"timestamp     : {frame0['timestamp']}")
-    print(f"state shape   : {tuple(frame0['observation.state'].shape)}")
-    print(f"image shape   : {tuple(frame0['observation.images.camera'].shape)}")
-    print(f"action shape  : {tuple(frame0['action'].shape)}")
-    print(f"task_index    : {frame0['task_index']}")
+    for episode_index in range(dataset.meta.total_episodes):
+        episode = dataset.meta.episodes[episode_index]
 
-    print("\nstate:")
-    print(frame0["observation.state"])
+        print(
+            f"Episode {episode_index}: "
+            f"from={episode['dataset_from_index']}, "
+            f"to={episode['dataset_to_index']}, "
+            f"length={episode['length']}"
+        )
 
-    print("\naction:")
-    print(frame0["action"])
+    print("\n========== Episode Boundary Frames ==========")
+
+    check_indices = [0, 19, 20, 39, 40, 59]
+
+    for index in check_indices:
+        frame = dataset[index]
+
+        print(
+            f"global_index={index:02d} | "
+            f"episode_index={int(frame['episode_index'])} | "
+            f"frame_index={int(frame['frame_index'])} | "
+            f"timestamp={float(frame['timestamp']):.2f}s | "
+            f"state[0]={float(frame['observation.state'][0]): .4f} | "
+            f"action[0]={float(frame['action'][0]): .4f}"
+        )
+
+    print("\n========== Expected Relationship ==========")
+    print("Global index : 0 ... 59        -> 整个 Dataset 连续")
+    print("Episode 0    : frame 0 ... 19  -> 一次完整任务")
+    print("Episode 1    : frame 0 ... 19  -> 新的一次完整任务")
+    print("Episode 2    : frame 0 ... 19  -> 又一次完整任务")
+    print("timestamp    : 每个 Episode 从 0 重新开始")
 
     print("\n========== Generated Files ==========")
 
     for path in sorted(DATASET_ROOT.rglob("*")):
         if path.is_file():
-            rel = path.relative_to(DATASET_ROOT)
-            print(rel)
+            print(path.relative_to(DATASET_ROOT))
 
 
 def main():
     dataset = create_dataset()
-    record_one_episode(dataset)
+    record_episodes(dataset)
     inspect_saved_dataset()
 
-    print("\n========== Final Data Flow ==========")
-    print("MockRobot.get_observation()")
-    print("        +")
-    print("MockExpert.get_action()")
-    print("        ↓")
-    print("LeRobotDataset.add_frame()")
-    print("        ↓")
-    print("LeRobotDataset.save_episode()")
-    print("        ↓")
-    print("LeRobotDataset.finalize()")
-    print("        ↓")
-    print(DATASET_ROOT)
+    print("\n========== Final Concept ==========")
+    print("Dataset 全局存储可以连续。")
+    print("但每个 Episode 是一条独立、连续、完整的任务轨迹。")
+    print()
+    print("Episode 内：")
+    print("Observation(t) -> Action(t) -> Observation(t+1) 连续")
+    print()
+    print("Episode 之间：")
+    print("通过 save_episode() 建立任务边界，")
+    print("不应该被当成同一条连续轨迹。")
 
 
 if __name__ == "__main__":
