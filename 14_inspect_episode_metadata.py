@@ -1,3 +1,5 @@
+from pprint import pprint
+
 from lerobot.datasets import LeRobotDatasetMetadata
 
 
@@ -6,6 +8,7 @@ REPO_ID = "lerobot/aloha_mobile_cabinet"
 
 def main():
     meta = LeRobotDatasetMetadata(REPO_ID)
+    episodes = meta.episodes
 
     print("========== Dataset ==========")
     print(f"Repo ID  : {REPO_ID}")
@@ -14,16 +17,16 @@ def main():
     print(f"FPS      : {meta.fps}")
 
     print("\n========== Episodes Type ==========")
-    print(type(meta.episodes))
+    print(type(episodes))
 
     print("\n========== Episodes Columns ==========")
-    print(meta.episodes.columns.tolist())
+    print(episodes.column_names)
 
     print("\n========== First 5 Episodes ==========")
-    print(meta.episodes.head())
+    pprint(episodes[:5])
 
     print("\n========== Episode 0 ==========")
-    print(meta.episodes.iloc[0])
+    pprint(episodes[0])
 
 
 if __name__ == "__main__":
