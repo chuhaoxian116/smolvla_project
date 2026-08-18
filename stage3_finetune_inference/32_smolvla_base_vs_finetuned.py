@@ -31,14 +31,18 @@ FINETUNED_CHECKPOINT = Path(
 )
 
 SAMPLE_INDEX = 5
+
 DEVICE = "cuda"
 LOCAL_FILES_ONLY = True
 
 
-def print_action_chunk(title: str, chunk: torch.Tensor):
+def print_action_chunk(
+    title: str,
+    chunk: torch.Tensor,
+):
     print(f"\n========== {title} ==========")
 
-    chunk_cpu = chunk.detach().cpu()
+    chunk_cpu = chunk.detach().float().cpu()
 
     print(f"Shape : {tuple(chunk_cpu.shape)}")
 
@@ -61,7 +65,7 @@ def main():
     torch.manual_seed(42)
 
     # =========================================================================
-    # 1. Dataset Metadata -> 用 Dataset 定义 Base Model 的输入 / 输出
+    # 1. Dataset Metadata -> 获取统一的 Feature / Stats
     # =========================================================================
     print("========== 1. Dataset Metadata ==========")
 
@@ -69,6 +73,10 @@ def main():
         repo_id=REPO_ID,
         root=DATASET_ROOT,
     )
+
+    print(f"Episodes : {metadata.total_episodes}")
+    print(f"Frames   : {metadata.total_frames}")
+    print(f"FPS      : {metadata.fps}")
 
     policy_features = dataset_to_policy_features(
         metadata.features
@@ -86,12 +94,8 @@ def main():
         if key not in output_features
     }
 
-    print(f"Episodes : {metadata.total_episodes}")
-    print(f"Frames   : {metadata.total_frames}")
-    print(f"FPS      : {metadata.fps}")
-
     # =========================================================================
-    # 2. Load Fine-tuned Model -> 训练后的模型
+    # 2. Fine-tuned Model -> 加载 Stage 2 训练后的 Checkpoint
     # =========================================================================
     print("\n========== 2. Load Fine-tuned Model ==========")
 
@@ -104,14 +108,29 @@ def main():
     finetuned_policy.eval()
 
     print(f"Checkpoint : {FINETUNED_CHECKPOINT}")
-    print(f"Chunk size : {finetuned_policy.config.chunk_size}")
+    print(
+        f"Device     : "
+        f"{next(finetuned_policy.parameters()).device}"
+    )
+    print(
+        f"Mode       : "
+        f"{'train' if finetuned_policy.training else 'eval'}"
+    )
+    print(
+        f"Chunk size : "
+        f"{finetuned_policy.config.chunk_size}"
+    )
     print(
         f"Action dim : "
         f"{finetuned_policy.config.action_feature.shape[0]}"
     )
+    print(
+        f"Max action dim : "
+        f"{finetuned_policy.config.max_action_dim}"
+    )
 
     # =========================================================================
-    # 3. Load Fine-tuned Processor
+    # 3. Fine-tuned Processors -> 恢复训练时保存的 Processor
     # =========================================================================
     print("\n========== 3. Load Fine-tuned Processors ==========")
 
@@ -135,7 +154,7 @@ def main():
     print("Fine-tuned PostProcessor : PASS")
 
     # =========================================================================
-    # 4. Build Base Model -> 使用与 Fine-tuned 相同的 Feature / Chunk 定义
+    # 4. Base Model -> 使用和 Fine-tuned 完全相同的 Action 定义
     # =========================================================================
     print("\n========== 4. Load Base Model ==========")
 
@@ -158,13 +177,29 @@ def main():
     base_policy.eval()
 
     print(f"Base model : {BASE_MODEL_ID}")
-    print(f"Chunk size : {base_policy.config.chunk_size}")
+    print(
+        f"Device     : "
+        f"{next(base_policy.parameters()).device}"
+    )
+    print(
+        f"Mode       : "
+        f"{'train' if base_policy.training else 'eval'}"
+    )
+    print(
+        f"Chunk size : "
+        f"{base_policy.config.chunk_size}"
+    )
     print(
         f"Action dim : "
         f"{base_policy.config.action_feature.shape[0]}"
     )
+    print(
+        f"Max action dim : "
+        f"{base_policy.config.max_action_dim}"
+    )
 
-    # Base Model 必须使用同一个 Dataset 的 stats。
+    # Base Model 使用相同 Dataset Stats，
+    # 保证输入 / 输出处于同一数据空间。
     base_preprocessor, base_postprocessor = (
         make_pre_post_processors(
             policy_cfg=base_cfg,
@@ -173,9 +208,42 @@ def main():
     )
 
     # =========================================================================
-    # 5. Observation -> 同一个输入同时给两个模型
+    # 5. Config Check -> 两个模型必须具有相同 Action 定义
     # =========================================================================
-    print("\n========== 5. Build Same Observation ==========")
+    print("\n========== 5. Config Check ==========")
+
+    same_chunk_size = (
+        base_policy.config.chunk_size
+        == finetuned_policy.config.chunk_size
+    )
+
+    same_action_dim = (
+        base_policy.config.action_feature.shape[0]
+        == finetuned_policy.config.action_feature.shape[0]
+    )
+
+    same_max_action_dim = (
+        base_policy.config.max_action_dim
+        == finetuned_policy.config.max_action_dim
+    )
+
+    print(f"Same chunk size     : {same_chunk_size}")
+    print(f"Same action dim     : {same_action_dim}")
+    print(f"Same max action dim : {same_max_action_dim}")
+
+    if not (
+        same_chunk_size
+        and same_action_dim
+        and same_max_action_dim
+    ):
+        raise RuntimeError(
+            "Base / Fine-tuned Action Config 不一致。"
+        )
+
+    # =========================================================================
+    # 6. Same Observation -> 两个模型使用完全相同的输入
+    # =========================================================================
+    print("\n========== 6. Build Same Observation ==========")
 
     dataset = LeRobotDataset(
         repo_id=REPO_ID,
@@ -184,22 +252,22 @@ def main():
 
     sample = dataset[SAMPLE_INDEX]
 
-    observation = {
-        "observation.state":
-            sample["observation.state"].clone(),
+    state = sample[
+        "observation.state"
+    ].clone()
 
-        "observation.images.camera":
-            sample["observation.images.camera"].clone(),
+    image = sample[
+        "observation.images.camera"
+    ].clone()
 
-        "task":
-            sample["task"],
-    }
+    task = sample["task"]
 
-    camera_key = "observation.images.camera"
-
-    if observation[camera_key].dtype == torch.uint8:
-        observation[camera_key] = (
-            observation[camera_key].to(torch.float32)
+    if (
+        isinstance(image, torch.Tensor)
+        and image.dtype == torch.uint8
+    ):
+        image = (
+            image.to(torch.float32)
             / 255.0
         )
 
@@ -207,58 +275,100 @@ def main():
     print(f"Episode      : {int(sample['episode_index'])}")
     print(f"Frame        : {int(sample['frame_index'])}")
     print(f"Timestamp    : {float(sample['timestamp']):.3f}s")
+    print(f"State shape  : {tuple(state.shape)}")
+    print(f"Image shape  : {tuple(image.shape)}")
+    print(f"Task         : {task!r}")
 
-    print(
-        f"State shape  : "
-        f"{tuple(observation['observation.state'].shape)}"
-    )
-
-    print(
-        f"Image shape  : "
-        f"{tuple(observation[camera_key].shape)}"
-    )
-
-    print(f"Task         : {observation['task']!r}")
-    print(f"Expert Action included : {'action' in observation}")
+    # 推理阶段不提供 Expert Action。
+    print("Expert Action included : False")
 
     # =========================================================================
-    # 6. PreProcessor -> 分别转换，但原始 Observation 完全相同
+    # 7. PreProcessor -> 同一个 Observation 分别转换
     # =========================================================================
-    print("\n========== 6. PreProcessor ==========")
+    print("\n========== 7. PreProcessor ==========")
+
+    base_observation = {
+        "observation.state": state.clone(),
+        "observation.images.camera": image.clone(),
+        "task": task,
+    }
+
+    finetuned_observation = {
+        "observation.state": state.clone(),
+        "observation.images.camera": image.clone(),
+        "task": task,
+    }
 
     base_obs = base_preprocessor(
-        {
-            "observation.state":
-                observation["observation.state"].clone(),
-
-            "observation.images.camera":
-                observation[camera_key].clone(),
-
-            "task":
-                observation["task"],
-        }
+        base_observation
     )
 
     finetuned_obs = finetuned_preprocessor(
-        {
-            "observation.state":
-                observation["observation.state"].clone(),
-
-            "observation.images.camera":
-                observation[camera_key].clone(),
-
-            "task":
-                observation["task"],
-        }
+        finetuned_observation
     )
 
     print("Base PreProcessor       : PASS")
     print("Fine-tuned PreProcessor : PASS")
 
+    print(
+        "Base state      :",
+        tuple(base_obs["observation.state"].shape),
+        base_obs["observation.state"].device,
+    )
+
+    print(
+        "Fine-tuned state:",
+        tuple(
+            finetuned_obs[
+                "observation.state"
+            ].shape
+        ),
+        finetuned_obs[
+            "observation.state"
+        ].device,
+    )
+
     # =========================================================================
-    # 7. Base Inference
+    # 8. Shared Noise -> 两个模型使用完全相同的 Flow Matching 初始 Noise
     # =========================================================================
-    print("\n========== 7. Base Model Inference ==========")
+    print("\n========== 8. Shared Noise ==========")
+
+    batch_size = (
+        base_obs[
+            "observation.state"
+        ].shape[0]
+    )
+
+    noise_shape = (
+        batch_size,
+        base_policy.config.chunk_size,
+        base_policy.config.max_action_dim,
+    )
+
+    base_device = (
+        base_obs[
+            "observation.state"
+        ].device
+    )
+
+    # SmolVLA 如果不指定 noise，会在每次推理时重新随机采样。
+    # 为了公平比较 Base / Fine-tuned，
+    # 这里显式生成一份 Noise，并同时提供给两个模型。
+    shared_noise = (
+        base_policy.model.sample_noise(
+            noise_shape,
+            base_device,
+        )
+    )
+
+    print(f"Noise shape  : {tuple(shared_noise.shape)}")
+    print(f"Noise dtype  : {shared_noise.dtype}")
+    print(f"Noise device : {shared_noise.device}")
+
+    # =========================================================================
+    # 9. Base Model Inference
+    # =========================================================================
+    print("\n========== 9. Base Model Inference ==========")
 
     if hasattr(base_policy, "reset"):
         base_policy.reset()
@@ -271,26 +381,33 @@ def main():
         ):
             base_raw_chunk = (
                 base_policy.predict_action_chunk(
-                    base_obs
+                    base_obs,
+                    noise=shared_noise.clone(),
                 )
             )
 
-    # make_pre_post_processors() 创建的 PostProcessor
-    # 输入类型是 PolicyAction，也就是 torch.Tensor。
-    base_action_chunk = base_postprocessor(
-        base_raw_chunk
+    print(
+        f"Base Raw Action Chunk : "
+        f"{tuple(base_raw_chunk.shape)}"
+    )
+
+    # make_pre_post_processors() 创建出的 PostProcessor
+    # 当前接口直接接收 PolicyAction Tensor。
+    base_action_chunk = (
+        base_postprocessor(
+            base_raw_chunk
+        )
     )
 
     print(
-        f"Base Action Chunk : "
+        f"Base Action Chunk     : "
         f"{tuple(base_action_chunk.shape)}"
     )
 
-
     # =========================================================================
-    # 8. Fine-tuned Inference
+    # 10. Fine-tuned Model Inference
     # =========================================================================
-    print("\n========== 8. Fine-tuned Model Inference ==========")
+    print("\n========== 10. Fine-tuned Model Inference ==========")
 
     if hasattr(finetuned_policy, "reset"):
         finetuned_policy.reset()
@@ -303,27 +420,72 @@ def main():
         ):
             finetuned_raw_chunk = (
                 finetuned_policy.predict_action_chunk(
-                    finetuned_obs
+                    finetuned_obs,
+                    noise=shared_noise.clone(),
                 )
             )
 
-    # 当前保存后再 reload 的 Processor，
-    # 已在 31 中验证需要 Transition 字典形式。
+    print(
+        f"Fine-tuned Raw Action Chunk : "
+        f"{tuple(finetuned_raw_chunk.shape)}"
+    )
+
+    # 当前从 checkpoint reload 的 PostProcessor，
+    # 31 已经验证需要 Transition 字典输入。
     finetuned_action_chunk = (
         finetuned_postprocessor(
             {
-                "action": finetuned_raw_chunk,
+                "action":
+                    finetuned_raw_chunk,
             }
         )["action"]
     )
 
     print(
-        f"Fine-tuned Action Chunk : "
+        f"Fine-tuned Action Chunk     : "
         f"{tuple(finetuned_action_chunk.shape)}"
     )
 
     # =========================================================================
-    # 9. Print Action Chunk -> 查看两边实际输出
+    # 11. Action Shape Check
+    # =========================================================================
+    print("\n========== 11. Action Shape Check ==========")
+
+    base_shape = tuple(
+        base_action_chunk.shape
+    )
+
+    finetuned_shape = tuple(
+        finetuned_action_chunk.shape
+    )
+
+    expected_shape = (
+        batch_size,
+        base_policy.config.chunk_size,
+        base_policy.config.action_feature.shape[0],
+    )
+
+    print(f"Base shape       : {base_shape}")
+    print(f"Fine-tuned shape : {finetuned_shape}")
+    print(f"Expected shape   : {expected_shape}")
+
+    shape_ok = (
+        base_shape == expected_shape
+        and finetuned_shape == expected_shape
+    )
+
+    print(
+        f"Shape check      : "
+        f"{'PASS' if shape_ok else 'FAIL'}"
+    )
+
+    if not shape_ok:
+        raise RuntimeError(
+            "Base / Fine-tuned Action Shape 异常。"
+        )
+
+    # =========================================================================
+    # 12. Print Actions
     # =========================================================================
     print_action_chunk(
         "Base Model Actions",
@@ -336,101 +498,181 @@ def main():
     )
 
     # =========================================================================
-    # 10. Difference -> 比较训练前后模型行为
+    # 13. Difference -> 训练前后 Action 差异
     # =========================================================================
-    print("\n========== 10. Base vs Fine-tuned ==========")
+    print("\n========== 13. Base vs Fine-tuned ==========")
 
-    difference = (
-        finetuned_action_chunk.detach().float().cpu()
-        - base_action_chunk.detach().float().cpu()
+    base_cpu = (
+        base_action_chunk
+        .detach()
+        .float()
+        .cpu()
     )
 
-    abs_difference = difference.abs()
+    finetuned_cpu = (
+        finetuned_action_chunk
+        .detach()
+        .float()
+        .cpu()
+    )
+
+    difference = (
+        finetuned_cpu
+        - base_cpu
+    )
+
+    abs_difference = (
+        difference.abs()
+    )
+
+    mean_difference = (
+        abs_difference
+        .mean()
+        .item()
+    )
+
+    max_difference = (
+        abs_difference
+        .max()
+        .item()
+    )
+
+    l2_difference = (
+        difference
+        .norm()
+        .item()
+    )
+
+    exactly_same = torch.equal(
+        base_cpu,
+        finetuned_cpu,
+    )
 
     print(
         f"Mean |difference| : "
-        f"{abs_difference.mean().item():.8f}"
+        f"{mean_difference:.8f}"
     )
 
     print(
         f"Max  |difference| : "
-        f"{abs_difference.max().item():.8f}"
+        f"{max_difference:.8f}"
     )
 
     print(
         f"L2 difference     : "
-        f"{difference.norm().item():.8f}"
+        f"{l2_difference:.8f}"
     )
 
-    same_output = torch.equal(
-        base_action_chunk.detach().cpu(),
-        finetuned_action_chunk.detach().cpu(),
+    print(
+        f"Exactly same      : "
+        f"{exactly_same}"
     )
 
-    print(f"Exactly same      : {same_output}")
-    print(f"Model behavior changed : {not same_output}")
+    print(
+        f"Model behavior changed : "
+        f"{not exactly_same}"
+    )
 
     # =========================================================================
-    # 11. Per-step Difference
+    # 14. Per-step Difference
     # =========================================================================
-    print("\n========== 11. Per-step Difference ==========")
+    print("\n========== 14. Per-step Difference ==========")
 
-    for step in range(difference.shape[1]):
-        step_diff = abs_difference[0, step]
+    for step in range(
+        difference.shape[1]
+    ):
+        step_diff = (
+            abs_difference[
+                0,
+                step,
+            ]
+        )
 
         print(
             f"Action[{step:02d}] | "
-            f"mean diff={step_diff.mean().item():.8f} | "
-            f"max diff={step_diff.max().item():.8f}"
+            f"mean diff="
+            f"{step_diff.mean().item():.8f} | "
+            f"max diff="
+            f"{step_diff.max().item():.8f}"
         )
 
     # =========================================================================
-    # 12. Result
+    # 15. Per-dimension Difference
     # =========================================================================
-    print("\n========== 12. Result ==========")
+    print("\n========== 15. Per-dimension Difference ==========")
+
+    action_dim = (
+        difference.shape[2]
+    )
+
+    for dim in range(action_dim):
+        dim_diff = (
+            abs_difference[
+                :,
+                :,
+                dim,
+            ]
+        )
+
+        print(
+            f"Joint[{dim + 1}] | "
+            f"mean diff="
+            f"{dim_diff.mean().item():.8f} | "
+            f"max diff="
+            f"{dim_diff.max().item():.8f}"
+        )
+
+    # =========================================================================
+    # 16. Result
+    # =========================================================================
+    print("\n========== 16. Result ==========")
 
     print("Same Observation         : PASS")
+    print("Same Flow Matching Noise : PASS")
+    print("Same Action Config       : PASS")
     print("Base inference           : PASS")
     print("Fine-tuned inference     : PASS")
     print("Base PostProcessor       : PASS")
     print("Fine-tuned PostProcessor : PASS")
+    print("Action shape             : PASS")
     print("Action comparison        : PASS")
 
     print()
+
     print(
         f"Model behavior changed : "
-        f"{not same_output}"
+        f"{not exactly_same}"
     )
 
     # =========================================================================
-    # 13. 主干总结
+    # 17. Main Flow
     # =========================================================================
     print("\n========== Main Flow ==========")
 
     print(
         """
-                  Same Observation
-             Camera + State + Task
-                       │
-             ┌─────────┴─────────┐
-             │                   │
-             ▼                   ▼
-       smolvla_base         Fine-tuned
-             │                   │
-             ▼                   ▼
-        PreProcessor         PreProcessor
-             │                   │
-             ▼                   ▼
-     predict_action_chunk  predict_action_chunk
-             │                   │
-             ▼                   ▼
-        PostProcessor        PostProcessor
-             │                   │
-             ▼                   ▼
-       Base Actions       Fine-tuned Actions
-             │                   │
-             └─────────┬─────────┘
-                       ▼
+                   Same Observation
+              Camera + State + Task
+                         │
+                         │
+                   Same Noise
+                         │
+             ┌───────────┴───────────┐
+             │                       │
+             ▼                       ▼
+       smolvla_base             Fine-tuned
+             │                       │
+             ▼                       ▼
+    predict_action_chunk     predict_action_chunk
+             │                       │
+             ▼                       ▼
+       PostProcessor             PostProcessor
+             │                       │
+             ▼                       ▼
+       Base Actions           Fine-tuned Actions
+             │                       │
+             └───────────┬───────────┘
+                         ▼
                  Compare Difference
 """
     )
@@ -438,21 +680,33 @@ def main():
     print("========== PASS ==========")
 
     print()
+    print("本 Demo 控制了两个主要变量：")
+    print()
+    print("  1. Same Observation")
+    print("  2. Same Flow Matching Noise")
+    print()
+    print("因此两边最主要的差异来自：")
+    print()
+    print("  Base Parameter")
+    print("       vs")
+    print("  Fine-tuned Parameter")
+    print()
     print("本 Demo 只回答：")
     print()
     print(
-        "Fine-tuning 是否改变了模型在同一个 "
-        "Observation 下输出的 Action？"
+        "Fine-tuning 是否改变了模型在相同条件下"
+        "生成的 Action？"
     )
     print()
     print("它暂时不回答：")
     print()
     print(
-        "Fine-tuned Action 是否比 Base Action 更正确。"
+        "Fine-tuned Action 是否更接近 Expert Action。"
     )
     print()
     print(
-        "下一步：33_smolvla_prediction_vs_expert.py"
+        "下一步："
+        "33_smolvla_prediction_vs_expert.py"
     )
 
 
