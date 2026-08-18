@@ -275,16 +275,17 @@ def main():
                 )
             )
 
+    # make_pre_post_processors() 创建的 PostProcessor
+    # 输入类型是 PolicyAction，也就是 torch.Tensor。
     base_action_chunk = base_postprocessor(
-        {
-            "action": base_raw_chunk,
-        }
-    )["action"]
+        base_raw_chunk
+    )
 
     print(
         f"Base Action Chunk : "
         f"{tuple(base_action_chunk.shape)}"
     )
+
 
     # =========================================================================
     # 8. Fine-tuned Inference
@@ -306,6 +307,8 @@ def main():
                 )
             )
 
+    # 当前保存后再 reload 的 Processor，
+    # 已在 31 中验证需要 Transition 字典形式。
     finetuned_action_chunk = (
         finetuned_postprocessor(
             {
